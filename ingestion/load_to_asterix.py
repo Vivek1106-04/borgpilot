@@ -9,6 +9,9 @@ Design choices:
     keeps `UNNEST` cheap.
   * Idempotent provisioning — every DDL uses `IF NOT EXISTS` so reruns are
     safe.
+  * Local decompression before LOAD — AsterixDB's localfs adapter does not
+    transparently decompress `.gz` JSON across versions, so we gunzip
+    shards into the same cache dir and feed it the plain `.json` path.
 
 Usage:
     borgpilot-ingest --table machine_events --shards 1
@@ -17,8 +20,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gzip
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -37,38 +42,43 @@ QUERY_ENDPOINT = ASTERIX_URL.rstrip("/") + "/query/service"
 
 
 # Open types — primary key columns are declared; everything else floats.
+#
+# IMPORTANT: Borg 2019 encodes INT64 fields as JSON strings to preserve 64-bit
+# precision across parsers (per Google's release note). We declare those keys
+# as `string`; agents/queries CAST to bigint when ordering or arithmetic on
+# `time` is required, e.g. `INT64(time) BETWEEN ...`.
 TYPES_SQLPP = {
     "machine_events": f"""
         CREATE TYPE {DATAVERSE}.MachineEventType IF NOT EXISTS AS OPEN {{
-            time: bigint,
-            machine_id: bigint
+            time: string,
+            machine_id: string
         }};
     """,
     "instance_events": f"""
         CREATE TYPE {DATAVERSE}.InstanceEventType IF NOT EXISTS AS OPEN {{
-            time: bigint,
-            collection_id: bigint,
-            instance_index: bigint
+            time: string,
+            collection_id: string,
+            instance_index: string
         }};
     """,
     "collection_events": f"""
         CREATE TYPE {DATAVERSE}.CollectionEventType IF NOT EXISTS AS OPEN {{
-            time: bigint,
-            collection_id: bigint
+            time: string,
+            collection_id: string
         }};
     """,
     "instance_usage": f"""
         CREATE TYPE {DATAVERSE}.InstanceUsageType IF NOT EXISTS AS OPEN {{
-            start_time: bigint,
-            end_time: bigint,
-            collection_id: bigint,
-            instance_index: bigint
+            start_time: string,
+            end_time: string,
+            collection_id: string,
+            instance_index: string
         }};
     """,
     "machine_attributes": f"""
         CREATE TYPE {DATAVERSE}.MachineAttributeType IF NOT EXISTS AS OPEN {{
-            time: bigint,
-            machine_id: bigint,
+            time: string,
+            machine_id: string,
             name: string
         }};
     """,
@@ -116,8 +126,9 @@ def provision_table(table: str) -> None:
     pk_cols, type_name = DATASETS[table]
     pk_clause = ", ".join(pk_cols)
     create_ds = (
-        f"CREATE DATASET {DATAVERSE}.{table} IF NOT EXISTS "
+        f"CREATE DATASET {DATAVERSE}.{table} "
         f"({DATAVERSE}.{type_name}) "
+        f"IF NOT EXISTS "
         f"PRIMARY KEY {pk_clause} "
         f"WITH {{'storage-format': {{'format': 'column'}}}};"
     )
@@ -125,23 +136,39 @@ def provision_table(table: str) -> None:
     log.info("dataset %s.%s ready (columnar)", DATAVERSE, table)
 
 
+def _ensure_decompressed(path: Path) -> Path:
+    """If `path` is gzipped, decompress next to it and return the plain path.
+
+    Idempotent: if the `.json` sibling already exists and is non-empty, reuse it.
+    """
+    if not str(path).endswith(".gz"):
+        return path
+    plain = path.with_suffix("")  # strips the `.gz`
+    if plain.exists() and plain.stat().st_size > 0:
+        return plain
+    log.info("decompressing %s -> %s", path, plain)
+    with gzip.open(path, "rb") as src, plain.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+    return plain
+
+
 def load_files(table: str, files: list[Path]) -> None:
     """Bulk-load JSON shards using AsterixDB's localfs adapter.
 
-    The 2019 release files end in `.json.gz`; AsterixDB's localfs adapter
-    handles the gzip transparently when `format=json` and `gzipped=true`.
+    Borg shards arrive as `.json.gz`; AsterixDB's localfs adapter does not
+    transparently decompress across versions, so we materialize a plain
+    `.json` sibling and feed it the uncompressed path.
     """
     if not files:
         log.warning("no files to load for %s", table)
         return
 
     for path in files:
-        abs_path = str(path.resolve())
-        is_gz = abs_path.endswith(".gz")
-        compression_clause = ', ("compression"="gzip")' if is_gz else ""
+        local_path = _ensure_decompressed(path)
+        abs_path = str(local_path.resolve())
         stmt = (
             f"LOAD DATASET {DATAVERSE}.{table} USING localfs "
-            f'(("path"="127.0.0.1://{abs_path}"), ("format"="json"){compression_clause});'
+            f'(("path"="127.0.0.1://{abs_path}"), ("format"="json"));'
         )
         log.info("LOAD %s into %s.%s", abs_path, DATAVERSE, table)
         run_sqlpp(stmt, timeout=600.0)

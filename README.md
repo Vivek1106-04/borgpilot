@@ -11,6 +11,61 @@ Model Context Protocol gateway gives an LLM enough surface area to act as
 an autonomous Level-3 SRE — discovering schemas, writing `UNNEST` queries,
 and producing evidence-backed root-cause summaries without hardcoded SQL.
 
+## Live demo
+
+A recorded end-to-end run against a freshly ingested shard of
+`borg.machine_events` (46,219 events, ~31 days of trace time). The agent
+runs inside Claude Desktop using the
+[`asterixdb-mcp-server`](https://github.com/Vivek1106-04/asterixdb-mcp-server)
+gateway — no hand-written SQL++ in the prompt.
+
+![Schema discovery and SQL++ drafting](docs/1.png)
+![Aggregation results and self-correction](docs/2.png)
+
+### What the agent did, unprompted
+
+1. Called `get_schema` on `borg.machine_events` — discovered the COLUMNAR
+   layout, the OPEN type, and the string-encoded INT64 `time` field.
+2. Drafted three SQL++ queries (total count, time range, top event types)
+   and submitted them via `execute_query`.
+3. **Self-corrected twice without being asked:**
+   * Bare `COUNT(*)` was plan-rejected because COLUMNAR storage requires
+     explicit projection. The agent pivoted to summing over a projected
+     `GROUP BY` and explained why.
+   * `type` is a SQL++ reserved word. The agent rewrote the alias with
+     backticks and continued.
+
+### Findings
+
+| Metric | Value |
+|--------|-------|
+| Total `machine_events` rows | 46,219 |
+| Time range (µs since trace start) | 0 &rarr; 2,678,851,683,489 |
+| Trace span | ~30.98 days |
+| Event distribution | type=1 ADD: 27,777 &middot; type=2 REMOVE: 17,941 &middot; type=3 UPDATE: 501 |
+
+The string-encoded INT64 `time` is decoded with `INT64(me.``time``)` at
+query time — no ETL, no type drift.
+
+### Reproduce locally
+
+```sql
+-- (a) total rows (projected column required on COLUMNAR storage)
+SELECT VALUE COUNT(me.machine_id) FROM borg.machine_events me;
+
+-- (b) time range, INT64-decoded
+SELECT MIN(INT64(me.`time`)) AS min_time,
+       MAX(INT64(me.`time`)) AS max_time
+FROM borg.machine_events me;
+
+-- (c) top event types (backtick the reserved word)
+SELECT me.`type` AS `type`, COUNT(me.machine_id) AS cnt
+FROM borg.machine_events me
+GROUP BY me.`type`
+ORDER BY cnt DESC
+LIMIT 5;
+```
+
 ## Stack
 
 ```

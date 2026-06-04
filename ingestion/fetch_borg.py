@@ -52,14 +52,23 @@ def _gsutil_available() -> bool:
 
 
 def list_shards(bucket: str, table: str) -> list[str]:
-    """Return the GCS URIs that make up a Borg table, sorted lexically."""
-    uri = f"{bucket.rstrip('/')}/{table}/"
+    """Return the GCS URIs that make up a Borg table, sorted lexically.
+
+    The 2019 release is flat: every shard lives at the bucket root as
+    `<table>-NNNNNNNNNNNN.json.gz` (and some tables also as `.parquet.gz`).
+    We prefer JSON since AsterixDB's localfs adapter loads it natively.
+    """
+    glob = f"{bucket.rstrip('/')}/{table}-*.json.gz"
     proc = subprocess.run(
-        ["gsutil", "ls", uri],
-        check=True,
+        ["gsutil", "ls", glob],
+        check=False,
         capture_output=True,
         text=True,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"gsutil ls {glob!r} failed: {proc.stderr.strip() or proc.stdout.strip()}"
+        )
     return sorted(line.strip() for line in proc.stdout.splitlines() if line.strip())
 
 
