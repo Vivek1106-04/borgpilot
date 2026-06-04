@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+*.egg-info/
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# GCP
+*-service-account.json
+gcp-key*.json
+.gcloud/
+
+# Logs / traces
+logs/
+agent_traces/
+*.log
+
+# Data (no local storage by design — but ignore anyway)
+data/
+*.parquet
+*.jsonl
+*.csv
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

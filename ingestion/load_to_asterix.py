@@ -1,0 +1,186 @@
+"""Provision the `borg` dataverse on a local AsterixDB cluster and bulk-load
+Borg 2019 shards via the Cluster Controller's `/query/service` endpoint.
+
+Design choices:
+  * Open types — Borg records evolve across cells and tables; an open type
+    accepts arbitrary additional fields without schema churn.
+  * COLUMNAR datasets — Borg telemetry is read-heavy with deeply-nested
+    fields; columnar storage materializes only the projected leaves and
+    keeps `UNNEST` cheap.
+  * Idempotent provisioning — every DDL uses `IF NOT EXISTS` so reruns are
+    safe.
+
+Usage:
+    borgpilot-ingest --table machine_events --shards 1
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import sys
+from pathlib import Path
+
+import httpx
+from dotenv import load_dotenv
+
+from ingestion.fetch_borg import ALLOWED_TABLES, DEFAULT_CACHE, fetch
+
+load_dotenv()
+
+log = logging.getLogger("borgpilot.load")
+
+ASTERIX_URL = os.environ.get("ASTERIX_URL", "http://localhost:19002")
+DATAVERSE = os.environ.get("ASTERIX_DATAVERSE", "borg")
+QUERY_ENDPOINT = ASTERIX_URL.rstrip("/") + "/query/service"
+
+
+# Open types — primary key columns are declared; everything else floats.
+TYPES_SQLPP = {
+    "machine_events": f"""
+        CREATE TYPE {DATAVERSE}.MachineEventType IF NOT EXISTS AS OPEN {{
+            time: bigint,
+            machine_id: bigint
+        }};
+    """,
+    "instance_events": f"""
+        CREATE TYPE {DATAVERSE}.InstanceEventType IF NOT EXISTS AS OPEN {{
+            time: bigint,
+            collection_id: bigint,
+            instance_index: bigint
+        }};
+    """,
+    "collection_events": f"""
+        CREATE TYPE {DATAVERSE}.CollectionEventType IF NOT EXISTS AS OPEN {{
+            time: bigint,
+            collection_id: bigint
+        }};
+    """,
+    "instance_usage": f"""
+        CREATE TYPE {DATAVERSE}.InstanceUsageType IF NOT EXISTS AS OPEN {{
+            start_time: bigint,
+            end_time: bigint,
+            collection_id: bigint,
+            instance_index: bigint
+        }};
+    """,
+    "machine_attributes": f"""
+        CREATE TYPE {DATAVERSE}.MachineAttributeType IF NOT EXISTS AS OPEN {{
+            time: bigint,
+            machine_id: bigint,
+            name: string
+        }};
+    """,
+}
+
+# (table -> primary key columns, type name)
+DATASETS: dict[str, tuple[list[str], str]] = {
+    "machine_events": (["time", "machine_id"], "MachineEventType"),
+    "instance_events": (["time", "collection_id", "instance_index"], "InstanceEventType"),
+    "collection_events": (["time", "collection_id"], "CollectionEventType"),
+    "instance_usage": (["start_time", "collection_id", "instance_index"], "InstanceUsageType"),
+    "machine_attributes": (["time", "machine_id", "name"], "MachineAttributeType"),
+}
+
+
+class AsterixError(RuntimeError):
+    """Raised when the AsterixDB Cluster Controller rejects a statement."""
+
+
+def run_sqlpp(statement: str, *, timeout: float = 120.0) -> dict:
+    """POST a single SQL++ statement to the CC and return the parsed response."""
+    resp = httpx.post(
+        QUERY_ENDPOINT,
+        data={"statement": statement, "format": "json"},
+        timeout=timeout,
+    )
+    if resp.status_code >= 400:
+        raise AsterixError(f"HTTP {resp.status_code} from CC: {resp.text[:400]}")
+    body = resp.json()
+    if errors := body.get("errors"):
+        raise AsterixError(f"CC rejected statement: {errors}")
+    return body
+
+
+def provision_dataverse() -> None:
+    run_sqlpp(f"CREATE DATAVERSE {DATAVERSE} IF NOT EXISTS;")
+    log.info("dataverse %s ready", DATAVERSE)
+
+
+def provision_table(table: str) -> None:
+    if table not in DATASETS:
+        raise ValueError(f"unknown table: {table!r}")
+    run_sqlpp(TYPES_SQLPP[table].strip())
+
+    pk_cols, type_name = DATASETS[table]
+    pk_clause = ", ".join(pk_cols)
+    create_ds = (
+        f"CREATE DATASET {DATAVERSE}.{table} IF NOT EXISTS "
+        f"({DATAVERSE}.{type_name}) "
+        f"PRIMARY KEY {pk_clause} "
+        f"WITH {{'storage-format': {{'format': 'column'}}}};"
+    )
+    run_sqlpp(create_ds)
+    log.info("dataset %s.%s ready (columnar)", DATAVERSE, table)
+
+
+def load_files(table: str, files: list[Path]) -> None:
+    """Bulk-load JSON shards using AsterixDB's localfs adapter.
+
+    The 2019 release files end in `.json.gz`; AsterixDB's localfs adapter
+    handles the gzip transparently when `format=json` and `gzipped=true`.
+    """
+    if not files:
+        log.warning("no files to load for %s", table)
+        return
+
+    for path in files:
+        abs_path = str(path.resolve())
+        is_gz = abs_path.endswith(".gz")
+        compression_clause = ', ("compression"="gzip")' if is_gz else ""
+        stmt = (
+            f"LOAD DATASET {DATAVERSE}.{table} USING localfs "
+            f'(("path"="127.0.0.1://{abs_path}"), ("format"="json"){compression_clause});'
+        )
+        log.info("LOAD %s into %s.%s", abs_path, DATAVERSE, table)
+        run_sqlpp(stmt, timeout=600.0)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    parser = argparse.ArgumentParser(
+        description="Provision the borg dataverse and bulk-load a Borg 2019 subset."
+    )
+    parser.add_argument("--table", required=True, choices=sorted(ALLOWED_TABLES))
+    parser.add_argument("--shards", type=int, default=1)
+    parser.add_argument(
+        "--skip-fetch",
+        action="store_true",
+        help="Assume shards are already in BORG_LOCAL_CACHE; skip gsutil download.",
+    )
+    args = parser.parse_args()
+
+    try:
+        provision_dataverse()
+        provision_table(args.table)
+        if args.skip_fetch:
+            cache = Path(os.environ.get("BORG_LOCAL_CACHE", DEFAULT_CACHE)) / args.table
+            files = sorted(cache.glob("*"))[: args.shards]
+            if not files:
+                raise RuntimeError(f"--skip-fetch but no shards found in {cache}")
+        else:
+            files = fetch(args.table, max_shards=args.shards)
+        load_files(args.table, files)
+    except (AsterixError, RuntimeError, ValueError) as e:
+        log.error("%s", e)
+        sys.exit(1)
+
+    print(f"\nIngested {len(files)} shard(s) into {DATAVERSE}.{args.table}.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,50 @@
+[project]
+name = "borgpilot"
+version = "0.1.0"
+description = "Autonomous SRE agent that performs root-cause analysis on Google Borg 2019 cluster traces via the AsterixDB MCP gateway."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Vivek" }]
+keywords = ["asterixdb", "mcp", "sre", "observability", "llm", "borg"]
+
+dependencies = [
+    "mcp>=1.2.0",
+    "anthropic>=0.40.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "python-dotenv>=1.0.1",
+    "rich>=13.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+    "mypy>=1.13.0",
+]
+
+[project.scripts]
+borgpilot = "agent.loop:main"
+borgpilot-ingest = "ingestion.load_to_asterix:main"
+borgpilot-fetch = "ingestion.fetch_borg:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agent*", "ingestion*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
