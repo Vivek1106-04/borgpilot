@@ -30,7 +30,7 @@ and producing evidence-backed root-cause summaries without hardcoded SQL.
 ```
 
 The companion MCP gateway lives in
-[`asterixdb-mcp-server`](https://github.com/YOUR_USER/asterixdb-mcp-server).
+[`asterixdb-mcp-server`](https://github.com/Vivek1106-04/asterixdb-mcp-server).
 BorgPilot spawns it as an stdio subprocess; you do not need to run it
 separately.
 
@@ -72,14 +72,14 @@ hypothesis we want to demonstrate:
 - `gsutil` on `PATH` (ships with `google-cloud-sdk`); no auth needed for
   anonymous reads of `gs://clusterdata_2019_*`
 - The companion
-  [`asterixdb-mcp-server`](https://github.com/YOUR_USER/asterixdb-mcp-server)
+  [`asterixdb-mcp-server`](https://github.com/Vivek1106-04/asterixdb-mcp-server)
   installed and on `PATH` (or referenced via `ASTERIXDB_MCP_COMMAND`)
 - An Anthropic API key
 
 ## Setup
 
 ```bash
-git clone https://github.com/YOUR_USER/borgpilot.git
+git clone https://github.com/Vivek1106-04/borgpilot.git
 cd borgpilot
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
