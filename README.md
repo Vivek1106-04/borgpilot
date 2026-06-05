@@ -11,6 +11,28 @@ Model Context Protocol gateway gives an LLM enough surface area to act as
 an autonomous Level-3 SRE — discovering schemas, writing `UNNEST` queries,
 and producing evidence-backed root-cause summaries without hardcoded SQL.
 
+## Results in 30 seconds
+
+- **46,219 events** loaded from Google Borg 2019 into a local AsterixDB
+  columnar dataverse — zero local trace storage outside the cluster.
+- **3 SQL++ queries** issued during the demo investigation — **zero hand-written**.
+  The agent drafted, validated, executed, and self-corrected end-to-end.
+- **Two AsterixDB quirks discovered + worked around unprompted**:
+  bare `COUNT(*)` is plan-rejected on COLUMNAR storage (agent pivoted to summing
+  over a projected `GROUP BY`); `type` is a reserved word (agent backticked).
+- **Trace span auto-recovered**: 30.98 days, `time` field correctly decoded as
+  string-encoded INT64 microseconds (per Borg 2019 JSON convention).
+- **Event distribution surfaced**: type=1 ADD `27,777` · type=2 REMOVE `17,941`
+  · type=3 UPDATE `501`.
+
+> **Why this matters.** Hyperscaler observability stacks process 100B+ traces
+> per day; Netflix alone reports ~700B. Relational engines collapse on the
+> nested-JSON UNNEST primitive that every such investigation needs. BorgPilot
+> shows that a columnar nested-type database plus the Model Context Protocol
+> is enough surface area for an off-the-shelf LLM to act as a Level-3 SRE
+> against real Google-scale telemetry — no fine-tuning, no hardcoded queries,
+> no row-explosion ETL.
+
 ## Live demo
 
 A recorded end-to-end run against a freshly ingested shard of
