@@ -24,6 +24,9 @@ and producing evidence-backed root-cause summaries without hardcoded SQL.
   string-encoded INT64 microseconds (per Borg 2019 JSON convention).
 - **Event distribution surfaced**: type=1 ADD `27,777` · type=2 REMOVE `17,941`
   · type=3 UPDATE `501`.
+- **Needle in a 10,001-machine haystack**: a follow-up flapper investigation
+  pinned one pathological host (`25013784437`, `359` events — **~78× the fleet
+  average**) stuck in an ADD↔REMOVE loop — flapper ranking ran in **~156 ms**.
 
 > **Why this matters.** Hyperscaler observability stacks process 100B+ traces
 > per day; Netflix alone reports ~700B. Relational engines collapse on the
@@ -68,6 +71,44 @@ gateway — no hand-written SQL++ in the prompt.
 
 The string-encoded INT64 `time` is decoded with `INT64(me.``time``)` at
 query time — no ETL, no type drift.
+
+### Going deeper: finding the one broken machine
+
+A second, harder investigation — *"which machines are flapping (churning in
+and out of the fleet most often)?"* — across the full **10,001-machine**
+fleet. Again, no hand-written SQL++ in the prompt.
+
+![Flapper query and SQL++ drafting](docs/3.png)
+![Flapper ranking and analysis](docs/4.png)
+
+The agent grouped 46,219 events by `machine_id`, ranked by churn, and computed
+the top-10's share of all activity — self-correcting on the `type` reserved
+word again along the way. The flapper ranking query executed in **~156 ms**.
+
+| Metric | Value |
+|--------|-------|
+| Distinct machines | 10,001 |
+| Avg events / machine | 4.62 |
+| Top-10 flappers' share of all events | 742 / 46,219 = **1.61%** |
+| Worst host (`25013784437`) | 359 events — **~78× the fleet average** |
+
+The headline find: a single pathological host (`25013784437`) stuck in an
+ADD↔REMOVE loop while 10,000 neighbors behaved. The agent also noted the
+churn was a long tail — *not* concentrated in a few bad hosts — except for
+that one outlier. A needle-in-haystack SRE result, surfaced unprompted.
+
+```sql
+-- top 10 flappers (collapsed to one row to dodge COLUMNAR truncation)
+SELECT VALUE (
+  SELECT machine_id,
+         COUNT(*) AS events,
+         COUNT(DISTINCT `type`) AS type_diversity
+  FROM borg.machine_events
+  GROUP BY machine_id
+  ORDER BY events DESC
+  LIMIT 10
+);
+```
 
 ### Reproduce locally
 
