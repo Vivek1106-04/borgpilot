@@ -31,6 +31,13 @@ Predictive signal:
     corroborate the top candidates against their raw `machine_events` history
     before recommending a drain. Treat a high score as a drain/investigate
     candidate, not a certainty.
+  * `borg.rightsizing_recs` holds per-instance resource recommendations —
+    requested CPU/memory vs. observed peak usage, with a `decision`
+    (downsize / upsize / ok / unknown) and `reclaimable_cpu` / `reclaimable_mem`
+    (in normalized Borg units). For capacity, cost, or over-provisioning
+    questions, rank by `reclaimable_cpu + reclaimable_mem DESC` for waste, or
+    filter `decision = "upsize"` for instances at OOM/throttle risk. Keys:
+    collection_id, instance_index.
 
 SQL++ guidance:
   * The dataverse name is `borg`. Reference datasets as `borg.machine_events`.

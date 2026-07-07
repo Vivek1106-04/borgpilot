@@ -11,12 +11,19 @@ Model Context Protocol gateway gives an LLM enough surface area to act as
 an autonomous Level-3 SRE — discovering schemas, writing `UNNEST` queries,
 and producing evidence-backed root-cause summaries without hardcoded SQL.
 
-It also goes **predictive**: a gradient-boosted model learns machine-failure
-precursors from `machine_events` history and writes a per-host risk score
-back into the cluster, turning the agent from a *reactive* root-cause tool
-into a *proactive* one that ranks drain candidates before they page you. The
-approach follows Microsoft Azure's Narya (OSDI 2020) predictive-mitigation
-work and Resource Central's (SOSP 2017) offline-predict / online-serve split.
+It also goes **predictive**. Two hyperscaler-grade analytics run offline and
+write their results back into the cluster for the agent to act on:
+
+- **Failure risk** (Microsoft Azure's Narya, OSDI 2020) — a gradient-boosted
+  model learns machine-failure precursors from `machine_events` history and
+  scores every host, so the agent ranks drain candidates *before* they page.
+- **Rightsizing** (Google Autopilot, EuroSys 2020) — per-instance resource
+  request vs. observed usage across `instance_events` + `instance_usage`,
+  surfacing over-provisioned waste and throttle/OOM risk.
+
+Both follow Resource Central's (SOSP 2017) offline-predict / online-serve
+split: predictions live in columnar datasets the agent reads through the same
+MCP tools as the raw telemetry — no side-channel store.
 
 ## Results in 30 seconds
 
@@ -158,6 +165,53 @@ ORDER BY risk_score DESC
 LIMIT 10;
 ```
 
+### Rightsizing: reclaiming over-provisioned instances
+
+Failure risk protects reliability; rightsizing protects the bill. BorgPilot
+compares each instance's resource **request** (from `instance_events`) against
+its observed **usage** (from `instance_usage`) and recommends a limit set to a
+safety margin above a spike-tolerant "typical peak" (the mean of the per-window
+`maximum_usage`) — Google Autopilot's core move, sizing to usage instead of to
+the static request. CPU and memory are sized independently (Borg limits are
+per-resource), and memory carries a larger margin because undersizing it means
+an OOM kill, not just throttling.
+
+The aggregation runs entirely in SQL++ — two `GROUP BY` queries collapse
+**25.7M** instance-event rows and **4.0M** usage windows to one row per
+instance before anything crosses the wire.
+
+| Metric | Value |
+|--------|-------|
+| instance_events rows scanned | 25,737,680 |
+| instance_usage windows scanned | 4,000,943 |
+| Instances sized (present in both shards) | 1,151 |
+| Decisions | downsize **315** · upsize **613** · ok **223** |
+| Reclaimable (normalized Borg units) | cpu **4.91** · mem **7.61** |
+
+The upsize-heavy split is a real Borg trait, not noise: users routinely
+under-request and lean on the scheduler's over-commit, so sustained usage sits
+above the request for a majority of instances. Recommendations land in a
+columnar `borg.rightsizing_recs` dataset the agent reads through MCP — rank by
+`reclaimable_cpu + reclaimable_mem` for waste, or filter `decision = "upsize"`
+for instances at throttle/OOM risk.
+
+```bash
+borgpilot-ingest --table instance_events --shards 1
+borgpilot-ingest --table instance_usage  --shards 1
+borgpilot-rightsize                 # train report + persist borg.rightsizing_recs
+borgpilot-rightsize --no-persist    # report only
+```
+
+```sql
+-- Biggest reclaim opportunities, read back as the agent sees them
+SELECT collection_id, instance_index, decision,
+       reclaimable_cpu, reclaimable_mem
+FROM borg.rightsizing_recs
+WHERE decision = 'downsize'
+ORDER BY reclaimable_cpu + reclaimable_mem DESC
+LIMIT 10;
+```
+
 ### Reproduce locally
 
 ```sql
@@ -212,12 +266,14 @@ borgpilot/
 │   └── load_to_asterix.py # provisions dataverse, types, datasets; bulk LOAD
 ├── sre/
 │   ├── features.py        # pure per-machine failure features + labels
-│   ├── asterix_io.py      # fetch machine_events; write back borg.machine_risk
-│   └── predict.py         # GBM training + fleet scoring (borgpilot-predict)
+│   ├── asterix_io.py      # cluster reads + write-backs (risk, rightsizing)
+│   ├── predict.py         # GBM failure risk + scoring (borgpilot-predict)
+│   └── rightsize.py       # Autopilot-style rightsizing (borgpilot-rightsize)
 ├── tests/
 │   ├── test_ingest_dryrun.py
 │   ├── test_features.py       # pure feature/label logic (no cluster)
-│   └── test_predict_dryrun.py # model + write-back math (no cluster)
+│   ├── test_predict_dryrun.py # model + write-back math (no cluster)
+│   └── test_rightsize.py      # sizing policy + join (no cluster)
 └── pyproject.toml
 ```
 
@@ -319,6 +375,9 @@ What happens under the hood:
 | `BORGPILOT_WINDOW_FRAC` | `0.10` | Trailing recency window as a fraction of the trace span. |
 | `BORGPILOT_TEST_FRAC` | `0.20` | Held-out split fraction for ROC-AUC. |
 | `BORGPILOT_SEED` | `0` | Random seed for the model and the train/test split. |
+| `BORGPILOT_CPU_MARGIN` | `1.15` | Rightsizing headroom above typical CPU peak. |
+| `BORGPILOT_MEM_MARGIN` | `1.25` | Rightsizing headroom above typical memory peak (higher — OOM risk). |
+| `BORGPILOT_DOWNSIZE_THRESHOLD` | `0.30` | Min slack share before an instance is a downsize candidate. |
 
 ## Roadmap
 
@@ -327,8 +386,9 @@ What happens under the hood:
 - [x] MCP-client agent loop with JSONL traces
 - [x] Predictive failure risk (Narya-style) — GBM over `machine_events`,
       ROC-AUC 0.897, scored back into `borg.machine_risk`
-- [ ] Autopilot-style rightsizing (EuroSys 2020) — request vs P95 usage slack
-      across `instance_events` + `instance_usage`
+- [x] Autopilot-style rightsizing (EuroSys 2020) — request vs typical-peak
+      usage slack across `instance_events` + `instance_usage`, written back
+      into `borg.rightsizing_recs`
 - [ ] Eval harness with synthetic fault injection + grader
 - [ ] Multi-table investigations (joins across `*_events` + `instance_usage`)
 

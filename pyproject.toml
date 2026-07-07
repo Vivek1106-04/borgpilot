@@ -32,6 +32,7 @@ borgpilot = "agent.loop:main"
 borgpilot-ingest = "ingestion.load_to_asterix:main"
 borgpilot-fetch = "ingestion.fetch_borg:main"
 borgpilot-predict = "sre.predict:main"
+borgpilot-rightsize = "sre.rightsize:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
