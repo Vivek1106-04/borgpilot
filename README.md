@@ -11,6 +11,13 @@ Model Context Protocol gateway gives an LLM enough surface area to act as
 an autonomous Level-3 SRE — discovering schemas, writing `UNNEST` queries,
 and producing evidence-backed root-cause summaries without hardcoded SQL.
 
+It also goes **predictive**: a gradient-boosted model learns machine-failure
+precursors from `machine_events` history and writes a per-host risk score
+back into the cluster, turning the agent from a *reactive* root-cause tool
+into a *proactive* one that ranks drain candidates before they page you. The
+approach follows Microsoft Azure's Narya (OSDI 2020) predictive-mitigation
+work and Resource Central's (SOSP 2017) offline-predict / online-serve split.
+
 ## Results in 30 seconds
 
 - **46,219 events** loaded from Google Borg 2019 into a local AsterixDB
@@ -110,6 +117,47 @@ SELECT VALUE (
 );
 ```
 
+### From detection to prediction: failure risk scoring
+
+Flapper ranking is *reactive* — it names hosts that already misbehaved. The
+next step is *proactive*: predict which machines are about to leave the fleet
+before they do. BorgPilot fits a gradient-boosted classifier on point-in-time
+features from `machine_events` (flap count, REMOVE-window density, inter-event
+interval, time-since-last-event, fleet state) with a leakage-free target —
+*did the machine emit a REMOVE within the trailing horizon of the trace* — and
+writes a ranked risk score for all 10,001 machines back into a new columnar
+dataset, `borg.machine_risk`.
+
+| Metric | Value |
+|--------|-------|
+| Machines scored | 10,001 |
+| Training positive rate | 0.218 |
+| **Held-out ROC-AUC** | **0.897** |
+| Serving target | `borg.machine_risk` (written back into the cluster) |
+
+Predictions live in the cluster, not a side-channel file — so the agent reads
+them through the *same* MCP tools it uses for raw telemetry (the Resource
+Central offline-predict / online-serve pattern). When an incident is about
+fleet stability, the agent ranks `borg.machine_risk` and corroborates the top
+candidates against their raw event history before recommending a drain —
+closing the **detect → predict → act** loop.
+
+```bash
+# Train, report held-out AUC, and persist borg.machine_risk
+borgpilot-predict
+
+# Train + report only, no write-back
+borgpilot-predict --no-persist --top 20
+```
+
+```sql
+-- Top drain candidates, read back exactly as the agent sees them
+SELECT machine_id, risk_score, remove_count, flap_count
+FROM borg.machine_risk
+ORDER BY risk_score DESC
+LIMIT 10;
+```
+
 ### Reproduce locally
 
 ```sql
@@ -162,8 +210,14 @@ borgpilot/
 ├── ingestion/
 │   ├── fetch_borg.py      # gsutil-based pull from gs://clusterdata_2019_*
 │   └── load_to_asterix.py # provisions dataverse, types, datasets; bulk LOAD
+├── sre/
+│   ├── features.py        # pure per-machine failure features + labels
+│   ├── asterix_io.py      # fetch machine_events; write back borg.machine_risk
+│   └── predict.py         # GBM training + fleet scoring (borgpilot-predict)
 ├── tests/
-│   └── test_ingest_dryrun.py
+│   ├── test_ingest_dryrun.py
+│   ├── test_features.py       # pure feature/label logic (no cluster)
+│   └── test_predict_dryrun.py # model + write-back math (no cluster)
 └── pyproject.toml
 ```
 
@@ -261,15 +315,22 @@ What happens under the hood:
 | `BORG_LOCAL_CACHE` | `./data/borg` | Where downloaded shards are cached. |
 | `BORGPILOT_MAX_TURNS` | `20` | Hard cap on the agent's tool-use loop. |
 | `BORGPILOT_LOG_DIR` | `./agent_traces` | Where JSONL investigation traces are written. |
+| `BORGPILOT_HORIZON_FRAC` | `0.15` | Prediction horizon as a fraction of the trace span. |
+| `BORGPILOT_WINDOW_FRAC` | `0.10` | Trailing recency window as a fraction of the trace span. |
+| `BORGPILOT_TEST_FRAC` | `0.20` | Held-out split fraction for ROC-AUC. |
+| `BORGPILOT_SEED` | `0` | Random seed for the model and the train/test split. |
 
 ## Roadmap
 
 - [x] AsterixDB-only data plane (no BigQuery in the agent path)
 - [x] Open-typed columnar Borg datasets
 - [x] MCP-client agent loop with JSONL traces
+- [x] Predictive failure risk (Narya-style) — GBM over `machine_events`,
+      ROC-AUC 0.897, scored back into `borg.machine_risk`
+- [ ] Autopilot-style rightsizing (EuroSys 2020) — request vs P95 usage slack
+      across `instance_events` + `instance_usage`
 - [ ] Eval harness with synthetic fault injection + grader
 - [ ] Multi-table investigations (joins across `*_events` + `instance_usage`)
-- [ ] Index recommendations from real query workload
 
 ## License
 

@@ -21,6 +21,17 @@ Investigation protocol — always follow this order on a cold start:
   4. Validate every non-trivial SQL++ with `validate_syntax` before execution.
   5. Run the query; if the optimizer plan or row counts look wrong, refine.
 
+Predictive signal:
+  * `borg.machine_risk` holds a per-machine failure-risk score (0..1) — the
+    modeled probability a machine emits a REMOVE within the horizon after the
+    trace end. Columns: machine_id, risk_score, remove_count, flap_count,
+    time_since_last, in_fleet, cutoff_time.
+  * When an incident is about fleet stability, churn, or "which hosts are
+    about to go bad", rank `borg.machine_risk` by `risk_score DESC` and
+    corroborate the top candidates against their raw `machine_events` history
+    before recommending a drain. Treat a high score as a drain/investigate
+    candidate, not a certainty.
+
 SQL++ guidance:
   * The dataverse name is `borg`. Reference datasets as `borg.machine_events`.
   * `time` (and `start_time` / `end_time` in instance_usage) is INT64 microseconds
