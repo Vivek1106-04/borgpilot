@@ -177,16 +177,16 @@ per-resource), and memory carries a larger margin because undersizing it means
 an OOM kill, not just throttling.
 
 The aggregation runs entirely in SQL++ — two `GROUP BY` queries collapse
-**25.7M** instance-event rows and **4.0M** usage windows to one row per
+**25.7M** instance-event rows and **15.7M** usage windows to one row per
 instance before anything crosses the wire.
 
 | Metric | Value |
 |--------|-------|
 | instance_events rows scanned | 25,737,680 |
-| instance_usage windows scanned | 4,000,943 |
-| Instances sized (present in both shards) | 1,151 |
-| Decisions | downsize **315** · upsize **613** · ok **223** |
-| Reclaimable (normalized Borg units) | cpu **4.91** · mem **7.61** |
+| instance_usage windows scanned | 15,683,574 (4 shards) |
+| Instances sized (present in both tables) | 1,409 |
+| Decisions | downsize **352** · upsize **782** · ok **275** |
+| Reclaimable (normalized Borg units) | cpu **5.65** · mem **8.76** |
 
 The upsize-heavy split is a real Borg trait, not noise: users routinely
 under-request and lean on the scheduler's over-commit, so sustained usage sits
@@ -197,10 +197,14 @@ for instances at throttle/OOM risk.
 
 ```bash
 borgpilot-ingest --table instance_events --shards 1
-borgpilot-ingest --table instance_usage  --shards 1
-borgpilot-rightsize                 # train report + persist borg.rightsizing_recs
+borgpilot-ingest --table instance_usage  --shards 4   # first shard bulk-LOADs, rest append
+borgpilot-rightsize                 # recommend + persist borg.rightsizing_recs
 borgpilot-rightsize --no-persist    # report only
 ```
+
+> Multi-shard ingest bulk-`LOAD`s the first shard into the empty dataset, then
+> appends the rest with `INSERT ... SELECT` over an external view — AsterixDB's
+> `LOAD` refuses a non-empty dataset.
 
 ```sql
 -- Biggest reclaim opportunities, read back as the agent sees them
